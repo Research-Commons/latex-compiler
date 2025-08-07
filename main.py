@@ -13,7 +13,7 @@ import requests
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://www.researchcommons.ai","https://okinresearch.com", "https://localhost:8000"],
+    allow_origins=["http://localhost:3000", "https://www.researchcommons.ai","https://okinresearch.com", "http://localhost:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
