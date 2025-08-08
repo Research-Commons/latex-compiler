@@ -2,15 +2,15 @@ import subprocess
 import tempfile
 import os
 from pathlib import Path
-from typing import List, Optional, Dict
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import Response
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 import logging
-import requests
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "https://www.researchcommons.ai","https://okinresearch.com", "http://localhost:8000"],
@@ -37,14 +37,23 @@ class FileInfo(BaseModel):
     name: str
     format: str  # File format (tex, pdf, etc.)
     content: str
-    url: str
     projectId: Optional[str] = None
+    ownerId: Optional[str] = None
+    created_at: str
+    updated_at: str
 
 class PaperFolderData(BaseModel):
     id: str
     name: str
+    type: str
+    tag: str
+    user_id: str
+    created_at: str
+    updated_at: str
+    user: Optional[Any] = None
     files: List[FileInfo]
     is_root: bool
+    depth: int
     subfolders: List['PaperFolderData'] = []
 
 class CompileRequest(BaseModel):
@@ -108,25 +117,16 @@ def create_project_structure(folder_data: PaperFolderData, base_path: Path, curr
             continue
         
         try:
+            # Handle binary files (encoded as base64) vs text files
             if file_info.format.lower() in ['png', 'jpg', 'jpeg', 'gif', 'pdf', 'eps']:
+                # Binary files - assume content is base64 encoded
+                import base64
                 try:
-                    # If content is not provided but URL is, download it
-                    if not file_info.content and file_info.url:
-                        response = requests.get(file_info.url)
-                        if response.status_code == 200:
-                            with open(file_path, 'wb') as f:
-                                f.write(response.content)
-                        else:
-                            logger.error(f"Failed to download image from URL: {file_info.url}")
-                            continue
-                    else:
-                        # Otherwise assume it's base64-encoded content
-                        import base64
-                        binary_content = base64.b64decode(file_info.content)
-                        with open(file_path, 'wb') as f:
-                            f.write(binary_content)
+                    binary_content = base64.b64decode(file_info.content)
+                    with open(file_path, 'wb') as f:
+                        f.write(binary_content)
                 except Exception as e:
-                    logger.error(f"Error writing image file {file_info.name}: {e}")
+                    logger.error(f"Error writing binary file {file_info.name}: {e}")
                     continue
             else:
                 # Text files
@@ -258,7 +258,7 @@ def validate_tex_file(tex_source: str) -> None:
                 detail=f"Potentially dangerous command detected: {cmd}"
             )
 
-def run_bibtex_if_needed(project_dir: Path, main_tex_name: str, compiler: str) -> bool:
+def run_bibtex_if_needed(project_dir: Path, main_tex_name: str, compiler: str) -> tuple[bool, str]:
     """
     Run bibtex/biber if bibliography files are present.
     
@@ -268,25 +268,27 @@ def run_bibtex_if_needed(project_dir: Path, main_tex_name: str, compiler: str) -
         compiler: LaTeX compiler being used
         
     Returns:
-        True if bibtex/biber was run, False otherwise
+        Tuple of (success: bool, logs: str)
     """
+    bib_logs = ""
+    
     # Check if there are .bib files
     bib_files = list(project_dir.rglob('*.bib'))
     if not bib_files:
-        return False
+        return False, "No .bib files found"
     
     # Check if .aux file exists and contains bibliography citations
     aux_file = project_dir / f"{main_tex_name}.aux"
     if not aux_file.exists():
-        return False
+        return False, "No .aux file found"
     
     try:
         with open(aux_file, 'r', encoding='utf-8', errors='ignore') as f:
             aux_content = f.read()
             if '\\bibdata' not in aux_content and '\\citation' not in aux_content:
-                return False
-    except Exception:
-        return False
+                return False, "No bibliography citations found in .aux file"
+    except Exception as e:
+        return False, f"Error reading .aux file: {str(e)}"
     
     # Try biber first (for biblatex), then bibtex
     for bib_processor in ['biber', 'bibtex']:
@@ -297,27 +299,35 @@ def run_bibtex_if_needed(project_dir: Path, main_tex_name: str, compiler: str) -
                 cwd=project_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                text=True,
                 timeout=30
             )
+            
+            bib_logs += f"=== {bib_processor.upper()} ===\n"
+            bib_logs += f"Return code: {proc.returncode}\n"
+            bib_logs += f"STDOUT:\n{proc.stdout}\n"
+            bib_logs += f"STDERR:\n{proc.stderr}\n\n"
+            
             if proc.returncode == 0:
                 logger.info(f"{bib_processor} completed successfully")
-                return True
-        except (subprocess.TimeoutExpired, FileNotFoundError):
+                return True, bib_logs
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            bib_logs += f"Failed to run {bib_processor}: {str(e)}\n"
             continue
     
     logger.warning("Could not run bibliography processor")
-    return False
+    return False, bib_logs
 
 @app.post("/compile-single")
 async def compile_single_file(file: UploadFile = File(...)):
     """
-    Compile a single LaTeX file to PDF.
+    Compile a single LaTeX file to PDF with detailed logs.
     
     Args:
         file: Uploaded .tex file
         
     Returns:
-        PDF file as response or error details
+        JSON response with compilation status, PDF data (hex if successful), and logs
     """
     # Validate file type
     if not file.filename.endswith('.tex'):
@@ -344,29 +354,72 @@ async def compile_single_file(file: UploadFile = File(...)):
                 f.write(tex_str)
             
             # Compile the document
-            success = await compile_project(project_dir, tex_path, compiler)
-            if not success:
-                raise HTTPException(status_code=422, detail="Compilation failed")
+            success, logs = await compile_project(project_dir, tex_path, compiler)
             
-            # Read and return the PDF
+            if not success:
+                return {
+                    "status": "error",
+                    "message": "LaTeX compilation failed",
+                    "error": "LaTeX compilation failed",
+                    "compiler": compiler,
+                    "logs": logs,
+                    "filename": file.filename
+                }
+            
+            # Read and return the PDF with logs
             pdf_path = project_dir / "main.pdf"
             with open(pdf_path, 'rb') as pdf_file:
                 pdf_data = pdf_file.read()
             
-            logger.info("LaTeX compilation successful")
-            return Response(
-                content=pdf_data,
-                media_type="application/pdf",
-                headers={
-                    "Content-Disposition": f"attachment; filename={file.filename.replace('.tex', '.pdf')}"
-                }
-            )
+            return {
+                "status": "success",
+                "message": "LaTeX compilation successful",
+                "compiler": compiler,
+                "pdf_data": pdf_data.hex(),
+                "logs": logs,
+                "filename": file.filename.replace('.tex', '.pdf')
+            }
     
     except Exception as e:
         logger.error(f"Compilation error: {str(e)}")
         if isinstance(e, HTTPException):
             raise
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        return {
+            "status": "error",
+            "message": "Internal server error",
+            "error": f"Internal server error: {str(e)}",
+            "logs": "",
+            "filename": file.filename if file.filename else "unknown"
+        }
+
+@app.post("/compile-single-download")
+async def compile_single_file_download(file: UploadFile = File(...)):
+    """
+    Compile a single LaTeX file to PDF and return as file download.
+    
+    Args:
+        file: Uploaded .tex file
+        
+    Returns:
+        PDF file as direct download
+    """
+    # Get the detailed response
+    detailed_response = await compile_single_file(file)
+    
+    if detailed_response["status"] == "success":
+        # Convert hex back to binary
+        pdf_data = bytes.fromhex(detailed_response["pdf_data"])
+        
+        return Response(
+            content=pdf_data,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f"attachment; filename={detailed_response['filename']}",
+                "X-Compilation-Logs": "See /compile-single for detailed logs"
+            }
+        )
+    else:
+        raise HTTPException(status_code=422, detail=detailed_response)
 
 @app.post("/compile-project")
 async def compile_latex_project(request: CompileRequest):
@@ -377,7 +430,7 @@ async def compile_latex_project(request: CompileRequest):
         request: CompileRequest containing project_data and optional main_file
         
     Returns:
-        PDF file as response or error details
+        JSON response with compilation status, PDF data (hex if successful), and logs
     """
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -410,36 +463,61 @@ async def compile_latex_project(request: CompileRequest):
             logger.info(f"Using compiler: {compiler} for project")
             
             # Compile the project
-            success = await compile_project(project_dir, main_tex_path, compiler)
+            success, logs = await compile_project(project_dir, main_tex_path, compiler)
+            
             if not success:
-                raise HTTPException(status_code=422, detail="Project compilation failed")
+                return {
+                    "status": "error",
+                    "message": "LaTeX project compilation failed",
+                    "error": "LaTeX project compilation failed",
+                    "compiler": compiler,
+                    "logs": logs,
+                    "main_file": main_tex_path.name,
+                    "project_name": request.project_data.name
+                }
             
             # Read and return the PDF
             pdf_name = main_tex_path.stem + ".pdf"
             pdf_path = main_tex_path.parent / pdf_name
             
             if not pdf_path.exists():
-                raise HTTPException(status_code=500, detail="PDF was not generated")
+                return {
+                    "status": "error",
+                    "message": "PDF was not generated",
+                    "error": "PDF was not generated despite successful compilation",
+                    "compiler": compiler,
+                    "logs": logs,
+                    "main_file": main_tex_path.name,
+                    "project_name": request.project_data.name
+                }
             
             with open(pdf_path, 'rb') as pdf_file:
                 pdf_data = pdf_file.read()
             
             logger.info("LaTeX project compilation successful")
-            return Response(
-                content=pdf_data,
-                media_type="application/pdf",
-                headers={
-                    "Content-Disposition": f"attachment; filename={request.project_data.name}.pdf"
-                }
-            )
+            return {
+                "status": "success",
+                "message": "LaTeX compilation successful",
+                "compiler": compiler,
+                "pdf_data": pdf_data.hex(),
+                "logs": logs,
+                "main_file": main_tex_path.name,
+                "project_name": request.project_data.name
+            }
     
     except Exception as e:
         logger.error(f"Project compilation error: {str(e)}")
         if isinstance(e, HTTPException):
             raise
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        return {
+            "status": "error",
+            "message": "Internal server error",
+            "error": f"Internal server error: {str(e)}",
+            "logs": "",
+            "project_name": getattr(request.project_data, 'name', 'unknown') if hasattr(request, 'project_data') else 'unknown'
+        }
 
-async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str) -> bool:
+async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str) -> tuple[bool, str]:
     """
     Compile a LaTeX project with proper handling of bibliography and multiple runs.
     
@@ -449,41 +527,41 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
         compiler: LaTeX compiler to use
         
     Returns:
-        True if compilation succeeded, False otherwise
+        Tuple of (success: bool, logs: str)
     """
     main_tex_name = main_tex_path.stem
     working_dir = main_tex_path.parent
+    all_logs = ""
+    first_pass_logs = ""
     
     try:
         # First compilation run
         logger.info("Running first compilation pass")
         proc = subprocess.run(
-            [
-                compiler,
-                '-interaction=nonstopmode',
-                '-halt-on-error',
-                main_tex_path.name
-            ],
+            [compiler, "-interaction=nonstopmode", main_tex_path.name],
             cwd=working_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            text=True,
             timeout=120
         )
+
+        first_pass_logs = f"=== First Compilation Pass ({compiler}) ===\n"
+        first_pass_logs += f"Return code: {proc.returncode}\n"
+        first_pass_logs += f"STDOUT:\n{proc.stdout}\n"
+        first_pass_logs += f"STDERR:\n{proc.stderr}\n\n"
+        all_logs += first_pass_logs
         
+        # Check if first pass failed critically
         if proc.returncode != 0:
-            error_log = proc.stdout.decode('utf-8', errors='ignore') + proc.stderr.decode('utf-8', errors='ignore')
-            logger.error(f"First compilation failed: {error_log}")
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "LaTeX compilation failed (first pass)",
-                    "compiler": compiler,
-                    "log": error_log
-                }
-            )
-        
+            logger.error(f"First compilation pass failed with return code {proc.returncode}")
+            return False, all_logs
+
         # Run bibliography processor if needed
-        bib_run = run_bibtex_if_needed(working_dir, main_tex_name, compiler)
+        bib_run, bib_logs = run_bibtex_if_needed(working_dir, main_tex_name, compiler)
+        if bib_run:
+            all_logs += bib_logs
+        else:
+            all_logs += f"=== Bibliography Processing ===\n{bib_logs}\n"
         
         # Second compilation run (for cross-references and bibliography)
         logger.info("Running second compilation pass")
@@ -491,26 +569,25 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
             [
                 compiler,
                 '-interaction=nonstopmode',
-                '-halt-on-error',
                 main_tex_path.name
             ],
             cwd=working_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
+            text=True,
             timeout=120
         )
         
+        second_pass_logs = f"=== Second Compilation Pass ({compiler}) ===\n"
+        second_pass_logs += f"Return code: {proc.returncode}\n"
+        second_pass_logs += f"STDOUT:\n{proc.stdout}\n"
+        second_pass_logs += f"STDERR:\n{proc.stderr}\n\n"
+        all_logs += second_pass_logs
+        
         if proc.returncode != 0:
-            error_log = proc.stdout.decode('utf-8', errors='ignore') + proc.stderr.decode('utf-8', errors='ignore')
-            logger.error(f"Second compilation failed: {error_log}")
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "LaTeX compilation failed (second pass)",
-                    "compiler": compiler,
-                    "log": error_log
-                }
-            )
+            logger.error(f"Second compilation pass failed with return code {proc.returncode}")
+            # Include first pass logs if second pass fails to provide full context
+            all_logs = first_pass_logs + all_logs
+            return False, all_logs
         
         # Third compilation run if bibliography was processed
         if bib_run:
@@ -519,28 +596,46 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
                 [
                     compiler,
                     '-interaction=nonstopmode',
-                    '-halt-on-error',
                     main_tex_path.name
                 ],
                 cwd=working_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
+                text=True,
                 timeout=120
             )
             
+            third_pass_logs = f"=== Third Compilation Pass ({compiler}) ===\n"
+            third_pass_logs += f"Return code: {proc.returncode}\n"
+            third_pass_logs += f"STDOUT:\n{proc.stdout}\n"
+            third_pass_logs += f"STDERR:\n{proc.stderr}\n\n"
+            all_logs += third_pass_logs
+            
             if proc.returncode != 0:
-                error_log = proc.stdout.decode('utf-8', errors='ignore') + proc.stderr.decode('utf-8', errors='ignore')
-                logger.error(f"Third compilation failed: {error_log}")
-                # Don't fail here - the PDF might still be usable
-                logger.warning("Third compilation failed, but continuing with existing PDF")
+                logger.warning("Third compilation pass failed, but continuing with existing PDF")
         
-        return True
+        # Check if PDF was actually generated
+        pdf_path = working_dir / f"{main_tex_name}.pdf"
+        if not pdf_path.exists():
+            all_logs += "=== ERROR ===\nPDF file was not generated despite successful compilation\n"
+            # Include first pass logs if PDF generation fails to provide full context
+            all_logs = first_pass_logs + all_logs
+            return False, all_logs
+            
+        all_logs += "=== COMPILATION SUCCESSFUL ===\n"
+        compile_project.last_logs = all_logs
+        return True, all_logs
         
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=408, detail="Compilation timeout")
+        all_logs += f"=== TIMEOUT ERROR ===\nCompilation timed out after 120 seconds\n"
+        # Include first pass logs for timeout to provide full context
+        all_logs = first_pass_logs + all_logs
+        return False, all_logs
     except Exception as e:
         logger.error(f"Compilation error: {str(e)}")
-        return False
+        all_logs += f"=== UNEXPECTED ERROR ===\n{str(e)}\n"
+        # Include first pass logs for unexpected errors to provide full context
+        all_logs = first_pass_logs + all_logs
+        return False, all_logs
 
 @app.get("/")
 async def root():
