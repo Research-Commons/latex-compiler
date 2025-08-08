@@ -208,22 +208,84 @@ The service automatically detects and processes bibliographies:
 
 ## Error Handling
 
-The service provides detailed error responses:
+The service provides detailed error responses with comprehensive compilation logs:
+
+## Error Handling
+
+The service provides detailed responses with comprehensive compilation logs. All compilation attempts return HTTP 200 with a structured response indicating success or failure:
+
+### Successful Compilation Response
 
 ```json
 {
-  "error": "LaTeX compilation failed",
+  "status": "success",
+  "message": "LaTeX compilation successful",
   "compiler": "pdflatex",
-  "log": "detailed compilation log..."
+  "pdf_data": "hex-encoded-pdf-data",
+  "logs": "=== First Compilation Pass (pdflatex) ===\n...",
+  "filename": "document.pdf"
 }
 ```
+
+### Failed Compilation Response
+
+```json
+{
+  "status": "error",
+  "message": "LaTeX compilation failed",
+  "error": "LaTeX compilation failed",
+  "compiler": "pdflatex",
+  "logs": "=== First Compilation Pass (pdflatex) ===\nReturn code: 1\nSTDOUT:\n! Undefined control sequence...\nSTDERR:\n...",
+  "filename": "document.tex"
+}
+```
+
+### Project Compilation Responses
+
+Project compilation includes additional fields:
+
+```json
+{
+  "status": "success|error",
+  "message": "Status message",
+  "compiler": "pdflatex",
+  "logs": "compilation logs...",
+  "main_file": "main.tex",
+  "project_name": "My Project",
+  "pdf_data": "hex-data (only on success)"
+}
+```
+
+### Compilation Log Structure
+
+The logs include detailed information for each compilation pass:
+
+- **First Pass**: Initial compilation with return codes and output (only shown on failure)
+- **Bibliography Processing**: Bibtex/biber execution details if applicable
+- **Second Pass**: Cross-reference resolution
+- **Third Pass**: Final bibliography integration (if needed)
+
+### HTTP Status Codes
+
+- `200`: Response returned (check `status` field for success/error)
+- `400`: Invalid input (bad file type, missing main file, dangerous commands)
+- `500`: Internal server error (rare cases)
+
+### Compilation Log Structure
+
+The logs include detailed information for each compilation pass:
+
+- **First Pass**: Initial compilation with return codes and output
+- **Bibliography Processing**: Bibtex/biber execution details if applicable
+- **Second Pass**: Cross-reference resolution
+- **Third Pass**: Final bibliography integration (if needed)
 
 Common HTTP status codes:
 
 - `200`: Successful compilation
 - `400`: Invalid input (bad file type, missing main file)
 - `408`: Compilation timeout
-- `422`: LaTeX compilation errors
+- `422`: LaTeX compilation errors (with detailed logs)
 - `500`: Internal server error
 
 ## Development
