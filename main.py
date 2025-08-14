@@ -3,9 +3,9 @@ import tempfile
 import os
 from pathlib import Path
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Extra
 from fastapi.middleware.cors import CORSMiddleware
 import logging
 
@@ -33,28 +33,35 @@ ALLOWED_EXTENSIONS = {
 
 class FileInfo(BaseModel):
     id: str
-    folder_id: str
+    folder_id: Optional[str] = None  # Make folder_id optional since it might not be provided
     name: str
     format: str  # File format (tex, pdf, etc.)
     content: str
     projectId: Optional[str] = None
     ownerId: Optional[str] = None
-    created_at: str
-    updated_at: str
+    url: Optional[str] = None  # Add url field since it's present in the data
+    created_at: Optional[str] = None  # Make created_at optional since it might not be provided
+    updated_at: Optional[str] = None  # Make updated_at optional since it might not be provided
+    
+    class Config:
+        extra = Extra.allow  # Allow extra fields
 
 class PaperFolderData(BaseModel):
     id: str
     name: str
-    type: str
-    tag: str
-    user_id: str
-    created_at: str
-    updated_at: str
+    type: Optional[str] = None  # Make type optional since it's not always provided
+    tag: Optional[str] = None  # Make tag optional since it might not be provided
+    user_id: Optional[str] = None  # Make user_id optional since it might not be provided
+    created_at: Optional[str] = None  # Make created_at optional since it might not be provided
+    updated_at: Optional[str] = None  # Make updated_at optional since it might not be provided
     user: Optional[Any] = None
-    files: List[FileInfo]
+    files: Optional[List[FileInfo]] = []  # Make files optional with default empty list
     is_root: bool
-    depth: int
-    subfolders: List['PaperFolderData'] = []
+    depth: Optional[int] = 0  # Make depth optional with default value
+    subfolders: Optional[List['PaperFolderData']] = []
+    
+    class Config:
+        extra = Extra.allow  # Allow extra fields
 
 class CompileRequest(BaseModel):
     project_data: PaperFolderData
@@ -103,47 +110,49 @@ def create_project_structure(folder_data: PaperFolderData, base_path: Path, curr
         current_path = folder_path
     
     # Create files in current folder
-    for file_info in folder_data.files:
-        if not is_safe_path(file_info.name):
-            logger.warning(f"Skipping unsafe file path: {file_info.name}")
-            continue
-        
-        file_path = current_path / file_info.name
-        
-        # Validate file extension
-        file_ext = Path(file_info.name).suffix.lower()
-        if file_ext and file_ext not in ALLOWED_EXTENSIONS:
-            logger.warning(f"Skipping file with unsupported extension: {file_info.name}")
-            continue
-        
-        try:
-            # Handle binary files (encoded as base64) vs text files
-            if file_info.format.lower() in ['png', 'jpg', 'jpeg', 'gif', 'pdf', 'eps']:
-                # Binary files - assume content is base64 encoded
-                import base64
-                try:
-                    binary_content = base64.b64decode(file_info.content)
-                    with open(file_path, 'wb') as f:
-                        f.write(binary_content)
-                except Exception as e:
-                    logger.error(f"Error writing binary file {file_info.name}: {e}")
-                    continue
-            else:
-                # Text files
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(file_info.content)
+    if folder_data.files:
+        for file_info in folder_data.files:
+            if not is_safe_path(file_info.name):
+                logger.warning(f"Skipping unsafe file path: {file_info.name}")
+                continue
             
-            file_paths[file_info.id] = file_path
-            logger.info(f"Created file: {file_path}")
+            file_path = current_path / file_info.name
             
-        except Exception as e:
-            logger.error(f"Error creating file {file_info.name}: {e}")
-            continue
+            # Validate file extension
+            file_ext = Path(file_info.name).suffix.lower()
+            if file_ext and file_ext not in ALLOWED_EXTENSIONS:
+                logger.warning(f"Skipping file with unsupported extension: {file_info.name}")
+                continue
+            
+            try:
+                # Handle binary files (encoded as base64) vs text files
+                if file_info.format.lower() in ['png', 'jpg', 'jpeg', 'gif', 'pdf', 'eps']:
+                    # Binary files - assume content is base64 encoded
+                    import base64
+                    try:
+                        binary_content = base64.b64decode(file_info.content)
+                        with open(file_path, 'wb') as f:
+                            f.write(binary_content)
+                    except Exception as e:
+                        logger.error(f"Error writing binary file {file_info.name}: {e}")
+                        continue
+                else:
+                    # Text files
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(file_info.content)
+                
+                file_paths[file_info.id] = file_path
+                logger.info(f"Created file: {file_path}")
+                
+            except Exception as e:
+                logger.error(f"Error creating file {file_info.name}: {e}")
+                continue
     
     # Recursively create subfolders
-    for subfolder in folder_data.subfolders:
-        subfolder_paths = create_project_structure(subfolder, base_path, current_path)
-        file_paths.update(subfolder_paths)
+    if folder_data.subfolders:
+        for subfolder in folder_data.subfolders:
+            subfolder_paths = create_project_structure(subfolder, base_path, current_path)
+            file_paths.update(subfolder_paths)
     
     return file_paths
 
@@ -163,13 +172,15 @@ def find_main_tex_file(folder_data: PaperFolderData, file_paths: Dict[str, Path]
     
     # Collect all .tex files recursively
     def collect_tex_files(folder: PaperFolderData):
-        for file_info in folder.files:
-            if file_info.format.lower() == 'tex':
-                if file_info.id in file_paths:
-                    tex_files.append((file_info, file_paths[file_info.id]))
+        if folder.files:
+            for file_info in folder.files:
+                if file_info.format.lower() == 'tex':
+                    if file_info.id in file_paths:
+                        tex_files.append((file_info, file_paths[file_info.id]))
         
-        for subfolder in folder.subfolders:
-            collect_tex_files(subfolder)
+        if folder.subfolders:
+            for subfolder in folder.subfolders:
+                collect_tex_files(subfolder)
     
     collect_tex_files(folder_data)
     
@@ -258,6 +269,34 @@ def validate_tex_file(tex_source: str) -> None:
                 detail=f"Potentially dangerous command detected: {cmd}"
             )
 
+def preprocess_tex_content(tex_source: str) -> str:
+    """
+    Preprocess LaTeX content to handle common issues and undefined commands.
+    
+    Args:
+        tex_source: The LaTeX source code to preprocess
+        
+    Returns:
+        Preprocessed LaTeX source code
+    """
+    # Handle common undefined commands that are often used in journal templates
+    replacements = {
+        '\\keywords': '\\textbf{Keywords:}',  # Replace \keywords with \textbf{Keywords:}
+        '\\PACS': '\\textbf{PACS:}',         # Replace \PACS with \textbf{PACS:}
+        '\\MSC': '\\textbf{MSC:}',           # Replace \MSC with \textbf{MSC:}
+        '\\JEL': '\\textbf{JEL:}',           # Replace \JEL with \textbf{JEL:}
+        '\\affiliation': '\\textit{Affiliation:}',  # Replace \affiliation with \textit{Affiliation:}
+        '\\correspondingauthor': '\\textbf{Corresponding Author:}',  # Replace \correspondingauthor
+        '\\email': '\\textit{Email:}',       # Replace \email with \textit{Email:}
+        '\\orcid': '\\textit{ORCID:}',       # Replace \orcid with \textit{ORCID:}
+    }
+    
+    processed_source = tex_source
+    for old_cmd, new_cmd in replacements.items():
+        processed_source = processed_source.replace(old_cmd, new_cmd)
+    
+    return processed_source
+
 def run_bibtex_if_needed(project_dir: Path, main_tex_name: str, compiler: str) -> tuple[bool, str]:
     """
     Run bibtex/biber if bibliography files are present.
@@ -337,6 +376,9 @@ async def compile_single_file(file: UploadFile = File(...)):
         # Read and decode the file
         tex_source = await file.read()
         tex_str = tex_source.decode('utf-8', errors='ignore')
+        
+        # Preprocess the LaTeX content to handle common issues
+        tex_str = preprocess_tex_content(tex_str)
         
         # Validate the LaTeX source
         validate_tex_file(tex_str)
@@ -432,6 +474,14 @@ async def compile_latex_project(request: CompileRequest):
     Returns:
         JSON response with compilation status, PDF data (hex if successful), and logs
     """
+    # Log the incoming request structure for debugging
+    logger.info(f"Received project compilation request for project: {request.project_data.name}")
+    logger.info(f"Project data fields: {list(request.project_data.__dict__.keys())}")
+    if request.project_data.files:
+        logger.info(f"Number of files: {len(request.project_data.files)}")
+        if request.project_data.files:
+            logger.info(f"First file fields: {list(request.project_data.files[0].__dict__.keys())}")
+    
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -454,6 +504,9 @@ async def compile_latex_project(request: CompileRequest):
             # Read main tex file to determine compiler
             with open(main_tex_path, 'r', encoding='utf-8', errors='ignore') as f:
                 tex_content = f.read()
+            
+            # Preprocess the LaTeX content to handle common issues
+            tex_content = preprocess_tex_content(tex_content)
             
             # Validate the LaTeX source
             validate_tex_file(tex_content)
@@ -517,6 +570,43 @@ async def compile_latex_project(request: CompileRequest):
             "project_name": getattr(request.project_data, 'name', 'unknown') if hasattr(request, 'project_data') else 'unknown'
         }
 
+@app.post("/debug-project")
+async def debug_project_structure(request: Request):
+    """
+    Debug endpoint to inspect the incoming project data structure.
+    This helps identify validation issues.
+    """
+    try:
+        # Get raw JSON data
+        raw_data = await request.json()
+        logger.info("Debug endpoint called with raw data")
+        logger.info(f"Raw data keys: {list(raw_data.keys()) if isinstance(raw_data, dict) else 'Not a dict'}")
+        
+        # Try to parse with our model
+        try:
+            parsed_request = CompileRequest(**raw_data)
+            return {
+                "status": "success",
+                "message": "Data parsed successfully",
+                "project_name": parsed_request.project_data.name,
+                "files_count": len(parsed_request.project_data.files) if parsed_request.project_data.files else 0,
+                "parsed_data": parsed_request.dict()
+            }
+        except Exception as validation_error:
+            return {
+                "status": "validation_error",
+                "message": "Data validation failed",
+                "error": str(validation_error),
+                "raw_data_keys": list(raw_data.keys()) if isinstance(raw_data, dict) else 'Not a dict',
+                "raw_data_sample": raw_data
+            }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Failed to process request",
+            "error": str(e)
+        }
+
 async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str) -> tuple[bool, str]:
     """
     Compile a LaTeX project with proper handling of bibliography and multiple runs.
@@ -536,7 +626,10 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
     
     try:
         # First compilation run
-        logger.info("Running first compilation pass")
+        logger.info(f"Running first compilation pass with {compiler}")
+        logger.info(f"Working directory: {working_dir}")
+        logger.info(f"Main tex file: {main_tex_path.name}")
+        
         proc = subprocess.run(
             [compiler, "-interaction=nonstopmode", main_tex_path.name],
             cwd=working_dir,
@@ -552,9 +645,10 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
         all_logs += first_pass_logs
         
         # Check if first pass failed critically
+        # Note: LaTeX can return non-zero exit codes even when PDF is generated successfully
+        # We'll check if PDF was actually generated later
         if proc.returncode != 0:
-            logger.error(f"First compilation pass failed with return code {proc.returncode}")
-            return False, all_logs
+            logger.warning(f"First compilation pass returned code {proc.returncode}, but continuing to check for PDF generation")
 
         # Run bibliography processor if needed
         bib_run, bib_logs = run_bibtex_if_needed(working_dir, main_tex_name, compiler)
@@ -584,10 +678,7 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
         all_logs += second_pass_logs
         
         if proc.returncode != 0:
-            logger.error(f"Second compilation pass failed with return code {proc.returncode}")
-            # Include first pass logs if second pass fails to provide full context
-            all_logs = first_pass_logs + all_logs
-            return False, all_logs
+            logger.warning(f"Second compilation pass returned code {proc.returncode}, but continuing to check for PDF generation")
         
         # Third compilation run if bibliography was processed
         if bib_run:
@@ -616,12 +707,25 @@ async def compile_project(project_dir: Path, main_tex_path: Path, compiler: str)
         # Check if PDF was actually generated
         pdf_path = working_dir / f"{main_tex_name}.pdf"
         if not pdf_path.exists():
-            all_logs += "=== ERROR ===\nPDF file was not generated despite successful compilation\n"
+            all_logs += "=== ERROR ===\nPDF file was not generated despite compilation attempts\n"
             # Include first pass logs if PDF generation fails to provide full context
             all_logs = first_pass_logs + all_logs
             return False, all_logs
+        
+        # Check if PDF is valid (not empty)
+        try:
+            pdf_size = pdf_path.stat().st_size
+            if pdf_size == 0:
+                all_logs += "=== ERROR ===\nPDF file was generated but is empty (0 bytes)\n"
+                return False, all_logs
+            all_logs += f"=== PDF GENERATED ===\nPDF file size: {pdf_size} bytes\n"
+        except Exception as e:
+            all_logs += f"=== ERROR ===\nCould not check PDF file: {str(e)}\n"
+            return False, all_logs
             
         all_logs += "=== COMPILATION SUCCESSFUL ===\n"
+        all_logs += f"PDF generated successfully: {pdf_path}\n"
+        all_logs += f"PDF file size: {pdf_path.stat().st_size} bytes\n"
         compile_project.last_logs = all_logs
         return True, all_logs
         
@@ -670,7 +774,8 @@ async def service_info():
         "service": "LaTeX Compilation Service",
         "endpoints": {
             "/compile-single": "Compile a single .tex file",
-            "/compile-project": "Compile a project from structured folder data (JSON)"
+            "/compile-project": "Compile a project from structured folder data (JSON)",
+            "/debug-project": "Debug endpoint to inspect project data structure"
         },
         "supported_extensions": list(ALLOWED_EXTENSIONS),
         "features": [
