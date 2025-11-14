@@ -1,0 +1,84 @@
+name: LaTeX Editor CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Authenticate with Google Cloud (Workload Identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: "projects/879556715683/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider"
+          service_account: "github-actions-sa@research-commons-main.iam.gserviceaccount.com"
+          create_credentials_file: true
+          export_environment_variables: true
+          universe: "googleapis.com"
+          cleanup_credentials: true
+          access_token_lifetime: "3600s"
+          access_token_scopes: "https://www.googleapis.com/auth/cloud-platform"
+          id_token_include_email: false
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure Docker auth for Artifact Registry
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+      - name: Build and Push LaTeX Editor image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/latex-editor/latex-editor-app:${{ github.sha }}
+            us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/latex-editor/latex-editor-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy LaTeX Editor to Compute Engine
+        run: |
+          # Auth for Artifact Registry on runner
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+          # SSH into the LaTeX editor VM
+          gcloud compute ssh ${{ secrets.LATEX_INSTANCE_NAME }} \
+            --zone=${{ secrets.LATEX_COMPUTE_ZONE }} \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --command='
+              # Inside VM: configure Docker auth for Artifact Registry
+              gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+              # Stop and remove old container (if any)
+              sudo docker stop latex-editor-app || true
+              sudo docker rm latex-editor-app || true
+
+              # Optional cleanup to save disk
+              sudo docker system prune -af
+              sudo docker image prune -a -f
+
+              # Pull new image
+              sudo docker pull us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/latex-editor/latex-editor-app:${{ github.sha }}
+
+              # Run new container (Dockerfile exposes 8000)
+              sudo docker run -d --restart unless-stopped \
+                -p 8000:8000 \
+                --name latex-editor-app \
+                us-central1-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/latex-editor/latex-editor-app:${{ github.sha }}'

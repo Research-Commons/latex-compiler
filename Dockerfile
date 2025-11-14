@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     texlive-fonts-extra \
     texlive-science \
     texlive-bibtex-extra \
+    texlive-publishers \
     texlive-xetex \
     texlive-lang-all \
     poppler-utils \
