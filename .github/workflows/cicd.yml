@@ -64,7 +64,7 @@ jobs:
             --project=${{ secrets.GCP_PROJECT_ID }} \
             --command='
               # Inside VM: configure Docker auth for Artifact Registry
-              gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+              sudo gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
 
               # Stop and remove old container (if any)
               sudo docker stop latex-editor-app || true
